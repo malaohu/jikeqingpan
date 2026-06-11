@@ -5,9 +5,11 @@ package main
 import (
 	"crypto/md5"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/dhowden/tag"
 	"io"
 	"log"
 	"net/http"
@@ -145,6 +147,42 @@ type fileListCache struct {
 	updatedAt   time.Time
 }
 
+// audioMetaCache 音频元数据缓存
+type audioMetaCache struct {
+	mu    sync.RWMutex
+	cache map[string]*audioMeta
+}
+
+type audioMeta struct {
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+	Album  string `json:"album"`
+	Cover  string `json:"cover"` // base64
+	Lyrics string `json:"lyrics"`
+	cached time.Time
+}
+
+func newAudioMetaCache() *audioMetaCache {
+	return &audioMetaCache{cache: make(map[string]*audioMeta)}
+}
+
+func (c *audioMetaCache) get(path string) (*audioMeta, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	meta, ok := c.cache[path]
+	if ok && time.Since(meta.cached) < 10*time.Minute {
+		return meta, true
+	}
+	return nil, false
+}
+
+func (c *audioMetaCache) set(path string, meta *audioMeta) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	meta.cached = time.Now()
+	c.cache[path] = meta
+}
+
 func newFileListCache() *fileListCache {
 	return &fileListCache{filesByPath: make(map[string]fileMeta)}
 }
@@ -201,29 +239,32 @@ func (c *fileListCache) getFileMeta(path string) (fileMeta, bool) {
 
 // Server 应用服务器
 type Server struct {
-	cfg       *Config
-	limiter   *RateLimiter
-	mux       *http.ServeMux
-	cache     *fileListCache // 文件列表缓存，dlink 存在服务端，不暴露给前端
-	uk        int64          // 百度用户uk
-	sk        string         // 百度授权sk
-	sessionMu sync.Mutex     // 保护 uk/sk 刷新
+	cfg        *Config
+	limiter    *RateLimiter
+	mux        *http.ServeMux
+	cache      *fileListCache // 文件列表缓存，dlink 存在服务端，不暴露给前端
+	audioCache *audioMetaCache
+	uk         int64      // 百度用户uk
+	sk         string     // 百度授权sk
+	sessionMu  sync.Mutex // 保护 uk/sk 刷新
 }
 
 func newServer(cfg *Config) *Server {
 	s := &Server{
-		cfg:     cfg,
-		limiter: newRateLimiter(cfg.RateLimitPerSecond),
-		mux:     http.NewServeMux(),
-		cache:   newFileListCache(),
+		cfg:        cfg,
+		limiter:    newRateLimiter(cfg.RateLimitPerSecond),
+		mux:        http.NewServeMux(),
+		cache:      newFileListCache(),
+		audioCache: newAudioMetaCache(),
 	}
 	s.mux.HandleFunc("/api/files", s.withSecurity(s.handleFiles))
 	s.mux.HandleFunc("/api/download", s.withSecurity(s.handleDownload))
+	s.mux.HandleFunc("/api/audiometa", s.withSecurity(s.handleAudioMeta))
 	// 使用 FileServer 提供 static/ 目录下的所有静态资源（index.html, app.js 等）
 	staticFS := http.FileServer(http.Dir("static"))
 	s.mux.HandleFunc("/", s.withSecurity(func(w http.ResponseWriter, r *http.Request) {
 		// 只允许访问 / 和已知静态文件，防止目录枚举
-		allowed := map[string]bool{"/": true, "/index.html": true, "/app.js": true}
+		allowed := map[string]bool{"/": true, "/index.html": true, "/app.js": true, "/aplayer/aplayer.min.js": true, "/aplayer/aplayer.min.css": true}
 		if !allowed[r.URL.Path] {
 			http.NotFound(w, r)
 			return
@@ -247,7 +288,7 @@ func (s *Server) withSecurity(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; object-src 'none'")
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.baidupcs.com; media-src https://*.baidupcs.com; frame-ancestors 'none'; object-src 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Cache-Control", "no-store")
@@ -328,7 +369,7 @@ func (s *Server) fetchUserSession() (int64, string, error) {
 		var resp struct {
 			Errno   int `json:"errno"`
 			Records []struct {
-				Uk int64 `json:"uk"`
+				Uk int64  `json:"uk"`
 				Sk string `json:"sk"`
 			} `json:"records"`
 		}
@@ -345,7 +386,7 @@ func (s *Server) fetchUserSession() (int64, string, error) {
 		if err2 == nil {
 			var resp2 struct {
 				Result struct {
-					Uk int64 `json:"uk"`
+					Uk int64  `json:"uk"`
 					Sk string `json:"sk"`
 				} `json:"result"`
 			}
@@ -556,8 +597,72 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleAudioMeta 获取音频文件元数据
+func (s *Server) handleAudioMeta(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" || !isValidBaiduPath(filePath) {
+		http.Error(w, "非法路径", http.StatusBadRequest)
+		return
+	}
 
+	// 检查缓存
+	if cached, ok := s.audioCache.get(filePath); ok {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(cached)
+		return
+	}
 
+	// 获取直链
+	dlink, err := s.getBaiduDLink(filePath, r.Header.Get("User-Agent"))
+	if err != nil {
+		log.Printf("[ERROR] 获取音频直链失败: %v", err)
+		http.Error(w, "获取直链失败", http.StatusBadGateway)
+		return
+	}
+
+	// 下载前 512KB 读取元数据
+	req, err := http.NewRequest("GET", dlink, nil)
+	if err != nil {
+		http.Error(w, "创建请求失败", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Range", "bytes=0-524287")
+	req.Header.Set("User-Agent", r.Header.Get("User-Agent"))
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "下载音频失败", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 读取到内存
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 524288))
+	if err != nil {
+		http.Error(w, "读取音频失败", http.StatusBadGateway)
+		return
+	}
+
+	meta := &audioMeta{}
+	m, err := tag.ReadFrom(strings.NewReader(string(data)))
+	if err == nil {
+		meta.Title = m.Title()
+		meta.Artist = m.Artist()
+		meta.Album = m.Album()
+		if pic := m.Picture(); pic != nil {
+			meta.Cover = "data:" + pic.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(pic.Data)
+		}
+		if lyrics := m.Lyrics(); lyrics != "" {
+			meta.Lyrics = lyrics
+		}
+	}
+
+	s.audioCache.set(filePath, meta)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(meta); err != nil {
+		log.Printf("[ERROR] JSON编码失败: %v", err)
+	}
+}
 
 // ---------- 百度网盘请求 ----------
 

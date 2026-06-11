@@ -3,6 +3,7 @@
 
 // ===== 全局状态 =====
 let currentDir = '/';
+let player = null;
 
 // ===== 工具函数 =====
 
@@ -42,12 +43,82 @@ function fileIcon(name, isDir) {
   return map[ext] || '📄';
 }
 
+/** 判断是否为音频文件 */
+function isAudioFile(name) {
+  const ext = (name || '').split('.').pop().toLowerCase();
+  return ['mp3', 'flac', 'wav', 'aac', 'm4a', 'ogg'].includes(ext);
+}
+
+/** 初始化播放器 */
+function initPlayer() {
+  if (!window.APlayer) return;
+  const container = document.getElementById('player-container');
+  player = new APlayer({
+    container: container,
+    audio: [],
+    mini: true,
+    autoplay: false,
+    theme: '#2563eb',
+    loop: 'none',
+    order: 'list',
+    preload: 'auto',
+    volume: 0.7,
+    mutex: true,
+    lrcType: 0
+  });
+}
+
+/** 播放音频文件 */
+function playAudio(filePath, fileName) {
+  if (!player) initPlayer();
+  if (!player) { showToast('❌ 播放器未加载'); return; }
+  showToast('⏳ 正在加载音频…');
+
+  Promise.all([
+    fetch('/api/download?path=' + encodeURIComponent(filePath) + '&format=json', { credentials: 'same-origin' }).then(function(r) { return r.json(); }),
+    fetch('/api/audiometa?path=' + encodeURIComponent(filePath), { credentials: 'same-origin' }).then(function(r) { return r.json(); }).catch(function() { return {}; })
+  ])
+    .then(function(results) {
+      const dlData = results[0];
+      const meta = results[1];
+      const urls = dlData.urls || [];
+      if (!urls.length || !urls[0].url) throw new Error('无法获取音频链接');
+
+      const audioUrl = urls[0].url;
+      const baseName = fileName.replace(/\.[^.]+$/, '');
+
+      player.list.clear();
+      player.list.add({
+        name: meta.title || baseName,
+        artist: meta.artist || '未知艺术家',
+        url: audioUrl,
+        cover: meta.cover || '',
+        lrc: meta.lyrics || ''
+      });
+      document.getElementById('player-container').classList.add('show');
+      player.play();
+      showToast('🎵 开始播放：' + fileName);
+    })
+    .catch(function(err) {
+      showToast('❌ 播放失败：' + err.message);
+    });
+}
+
 /** 显示 Toast 提示 */
 function showToast(msg) {
-  const toast = document.getElementById('toast');
+  let toast = document.getElementById('toast');
+  if (toast) toast.remove();
+
+  toast = document.createElement('div');
+  toast.id = 'toast';
+  toast.className = 'show';
   toast.textContent = msg;
-  toast.classList.add('show');
-  setTimeout(function() { toast.classList.remove('show'); }, 2500);
+  document.body.appendChild(toast);
+
+  setTimeout(function() {
+    toast.classList.remove('show');
+    setTimeout(function() { toast.remove(); }, 250);
+  }, 2500);
 }
 
 // ===== 路径导航与面包屑 =====
@@ -246,9 +317,9 @@ function buildFileItem(file) {
   const metaEl = document.createElement('div');
   metaEl.className = 'file-meta';
   if (isDir) {
-    metaEl.textContent = '文件夹  ·  ' + formatTime(file.local_mtime);
+    metaEl.textContent = formatTime(file.local_mtime);
   } else {
-    metaEl.textContent = formatSize(file.size) + '  ·  ' + formatTime(file.local_mtime);
+    metaEl.textContent = formatSize(file.size) + ' · ' + formatTime(file.local_mtime);
   }
   infoEl.appendChild(metaEl);
 
@@ -289,13 +360,30 @@ function buildFileItem(file) {
     });
     actionsEl.appendChild(copyBtn);
 
+    if (isAudioFile(fileName)) {
+      const playBtn = document.createElement('button');
+      playBtn.className = 'file-action';
+      playBtn.setAttribute('type', 'button');
+      playBtn.textContent = '播放 🎵';
+      playBtn.setAttribute('aria-label', '播放 ' + fileName);
+      playBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        playAudio(filePath, fileName);
+      });
+      actionsEl.appendChild(playBtn);
+      item.addEventListener('click', function() {
+        playAudio(filePath, fileName);
+      });
+    } else {
+      item.addEventListener('click', function() {
+        downloadFile(filePath, fileName);
+      });
+    }
+
     actionBtn.textContent = '下载 ⬇';
     actionBtn.setAttribute('aria-label', '下载 ' + fileName);
     actionBtn.addEventListener('click', function(e) {
       e.stopPropagation();
-      downloadFile(filePath, fileName);
-    });
-    item.addEventListener('click', function() {
       downloadFile(filePath, fileName);
     });
     actionsEl.appendChild(actionBtn);
@@ -365,6 +453,7 @@ function copyLink(filePath) {
 
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', function() {
+  initPlayer();
   loadFiles();
   document.getElementById('btn-refresh').addEventListener('click', function() {
     loadFiles(currentDir);
